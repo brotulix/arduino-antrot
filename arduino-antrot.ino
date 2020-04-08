@@ -9,64 +9,15 @@ const uint16_t dstPort PROGMEM = 31560;
 
 #define COMMAND_LINE_MAX_COMMAND_LENGTH         8 // Currently something like "#G,360;"
 #define COMMAND_LINE_MIN_COMMAND_LENGTH         3 // Currently something like "#P;"
-#define COMMAND_LINE_SERIAL_BUFFER_SIZE         32
-#define COMMAND_LINE_BUFFER_SIZE                128
-#define COMMAND_LINE_APPEND_THRESHOLD           96 // ((COMMAND_LINE_BUFFER_SIZE / 4) * 3)
-
-char serbuf[COMMAND_LINE_SERIAL_BUFFER_SIZE] = { 0 };
-uint8_t serlength = 0;
+#define COMMAND_LINE_BUFFER_SIZE                64
 
 char cmdline[COMMAND_LINE_BUFFER_SIZE] = { 0 };
 uint8_t cmdlength = 0;
 
 #define MAX_SEQUENCE_LENGTH     10
-
-enum outputPins {
-    MOTOR_OUT_A         = 5,
-    MOTOR_OUT_B         = 6,
-    ANALOG_INPUT        = A0,
-    DIGITAL_INPUT_A     = 2,   // Interrupt pin
-    DIGITAL_INPUT_B     = 3,   // Interrupt pin
-    RELAY_OUT_A         = 7,
-    RELAY_OUT_B         = 8,
-    RELAY_OUT_C         = 9,
-    ETHER_CS            = 10,
-    RELAY_SPEED         = RELAY_OUT_A,
-    RELAY_DIRECTION     = RELAY_OUT_B,
-    RELAY_DRIVE         = RELAY_OUT_C
-};
-
-typedef enum OutputType {
-    OUTPUT_TYPE_RELAY = 0,
-    OUTPUT_TYPE_PWM,
-    OUTPUT_TYPE_VARIABLE,
-    OUTPUT_TYPE_STATE
-} tOutputType;
-
-typedef enum OutputChannel {
-    OUTPUT_CHANNEL_TARGET_HEADING = -1,
-    OUTPUT_CHANNEL_UNUSED = 0,
-    OUTPUT_CHANNEL_MOTOR_A = MOTOR_OUT_A,
-    OUTPUT_CHANNEL_MOTOR_B = MOTOR_OUT_B,
-    OUTPUT_CHANNEL_PWM = MOTOR_OUT_A,
-    OUTPUT_CHANNEL_DIRECTION = RELAY_OUT_C,
-    OUTPUT_CHANNEL_VOLTAGE = RELAY_OUT_A,
-    OUTPUT_CHANNEL_ENABLE = RELAY_OUT_B
-} tOutputChannel;
-
-typedef struct sequence_step {
-    uint16_t countdown;
-    int16_t value;
-    tOutputChannel channel;
-    tOutputType output;
-} tSequenceStep;
-
-typedef struct sequence {
-    uint8_t items;
-    tSequenceStep sequence[MAX_SEQUENCE_LENGTH];
-} tSequence;
-
-tSequence sequence;
+#define ANALOG_INPUT            A0
+#define DIGITAL_INPUT_A         2 // Interrupt pin
+#define DIGITAL_INPUT_B         3 // Interrupt pin
 
 // Need to be PWM pins for speed control
 #define MOTOR_PWM           MOTOR_OUT_A
@@ -80,21 +31,210 @@ tSequence sequence;
 #define SPEED_CREEP         0
 #define SPEED_FAST          1
 
-uint8_t direction = CLOCKWISE;
-uint8_t run = STOP;
 uint32_t lastinterrupt = 0;
 
-uint8_t stateMachineState = 0;
+enum outputPins
+{
+    OUTPUT_PIN_UNUSED          = -1,
+    OUTPUT_PIN_MOTOR_OUT_A     = 5,
+    OUTPUT_PIN_MOTOR_OUT_B     = 6,
+    OUTPUT_PIN_RELAY_OUT_A     = 7,
+    OUTPUT_PIN_RELAY_OUT_B     = 8,
+    OUTPUT_PIN_RELAY_OUT_C     = 9,
+    OUTPUT_PIN_ETHER_CS        = 10
+};
 
-#define STATE_IDLE                      0
-#define STATE_STARTING                  1
-#define STATE_TRAVERSING                2
-#define STATE_STOPPING                  3
-#define STATE_CORRECTING                4
-#define STATE_ERROR                     5
-#define STATE_MAX_STATE                 STATE_ERROR
+/*
+    RELAY_VOLTAGE         = RELAY_OUT_A,
+    RELAY_DIRECTION     = RELAY_OUT_B,
+    RELAY_DRIVE         = RELAY_OUT_C
+*/
 
 
+typedef enum OutputType
+{
+    OUTPUT_TYPE_RELAY = 0,
+    OUTPUT_TYPE_PWM,
+    OUTPUT_TYPE_VARIABLE,
+    OUTPUT_TYPE_STATE
+} tOutputType;
+
+typedef enum Outputs
+{
+    OUTPUT_RELAY_VOLTAGE,
+    OUTPUT_RELAY_DRIVE,
+    OUTPUT_RELAY_DIRECTION,
+    OUTPUT_PWM_MOTOR_A,
+    OUTPUT_VARIABLE_HEADING,
+    OUTPUT_VARIABLE_STATE,
+    OUTPUT_NUM_VALUES
+} tOutputs;
+
+typedef struct Output
+{
+    tOutputs output;
+    tOutputType type;
+    int pin;
+    int value;
+} tOutput;
+
+tOutput output[OUTPUT_NUM_VALUES];
+
+// @todo: Consider encoding both output type and pin number in same enum value
+//          (eg. MSB as tOutputType) and LSB as tOutputChannel).
+//          Or a struct with known pin and variable definitions
+typedef struct sequence_step
+{
+    uint16_t countdown;
+    int16_t value;
+    tOutputs channel;
+} tSequenceStep;
+
+typedef struct sequence {
+    uint8_t items;
+    tSequenceStep sequence[MAX_SEQUENCE_LENGTH];
+} tSequence;
+
+tSequence sequence;
+
+
+typedef enum States
+{
+    STATE_IDLE          = 0,
+    STATE_STARTING      = 1,
+    STATE_TRAVERSING    = 2,
+    STATE_STOPPING      = 3,
+    STATE_CORRECTING    = 4,
+    STATE_ERROR         = 5,
+    STATE_MAX_STATE     = STATE_ERROR
+} tStates;
+
+
+
+void initializeOutputs()
+{
+    int i = 0;
+
+    output[OUTPUT_RELAY_VOLTAGE] = 
+    {
+        OUTPUT_RELAY_VOLTAGE,
+        OUTPUT_TYPE_RELAY,
+        OUTPUT_PIN_RELAY_OUT_A,
+        0
+    };
+    
+    output[OUTPUT_RELAY_DRIVE] = 
+    {
+        OUTPUT_RELAY_DRIVE,
+        OUTPUT_TYPE_RELAY,
+        OUTPUT_PIN_RELAY_OUT_B,
+        0
+    };
+    
+    output[OUTPUT_RELAY_DIRECTION] = 
+    {
+        OUTPUT_RELAY_DIRECTION,
+        OUTPUT_TYPE_RELAY,
+        OUTPUT_PIN_RELAY_OUT_C,
+        0
+    };
+    
+    output[OUTPUT_PWM_MOTOR_A] = 
+    {
+        OUTPUT_PWM_MOTOR_A,
+        OUTPUT_TYPE_PWM,
+        OUTPUT_PIN_MOTOR_OUT_A,
+        0
+    };
+    
+    output[OUTPUT_VARIABLE_HEADING] = 
+    {
+        OUTPUT_VARIABLE_HEADING,
+        OUTPUT_TYPE_VARIABLE,
+        OUTPUT_PIN_UNUSED,
+        0
+    };
+
+    output[OUTPUT_VARIABLE_STATE] =
+    {
+        OUTPUT_VARIABLE_STATE,
+        OUTPUT_TYPE_VARIABLE,
+        OUTPUT_PIN_UNUSED,
+        0
+    };
+
+    for(i = 0; i < OUTPUT_NUM_VALUES; i++)
+    {
+        if(output[i].pin != OUTPUT_PIN_UNUSED)
+        {
+            pinMode(output[i].pin, OUTPUT);
+        }
+
+        setOutput(output[i].output, 0);
+    }
+}
+
+
+
+void setOutput(tOutputs o, int16_t v)
+{
+    switch (output[o].type)
+    {
+        case OUTPUT_TYPE_RELAY:
+        {
+            if(v < 0)
+            {
+                output[o].value = !output[o].value;
+            }
+            else
+            {
+                output[o].value = v;
+            }
+
+            digitalWrite(output[o].pin, output[o].value);
+            
+            break;
+        }
+
+        case OUTPUT_TYPE_PWM:
+        {
+            if(v<0)
+            {
+                output[o].value = 0;
+            }
+            else
+            {
+                output[o].value = v;
+            }
+
+            analogWrite(output[o].pin, output[o].value);
+            
+            break;
+        }
+
+        case OUTPUT_TYPE_VARIABLE:
+        {
+            output[o].value = v;
+            
+            break;
+        }
+
+        case OUTPUT_TYPE_STATE:
+        {
+            setState(v);
+            
+            break;
+        }
+        
+        default:
+        {
+            Serial.print("#E,setOutput: Unknown pin ");
+            Serial.print(o);
+            Serial.println(";");
+            break;
+        }
+    }
+}
 
 void clearSequence()
 {
@@ -121,13 +261,11 @@ void printSequence()
         Serial.print(", ");
         Serial.print(sequence.sequence[i].value);
         Serial.print(", ");
-        Serial.print(sequence.sequence[i].channel);
-        Serial.print(", ");
-        Serial.println(sequence.sequence[i].output);
+        Serial.println(sequence.sequence[i].channel);
     }
 }
 
-int8_t pushSequence(tSequenceStep* src_step)
+int8_t pushSequence(tSequenceStep* srcstep)
 {
     if(sequence.items >= MAX_SEQUENCE_LENGTH)
     {
@@ -135,21 +273,24 @@ int8_t pushSequence(tSequenceStep* src_step)
         return -1;
     }
 
-    sequence.sequence[sequence.items].countdown = src_step->countdown;
-    sequence.sequence[sequence.items].value     = src_step->value;
-    sequence.sequence[sequence.items].channel   = src_step->channel;
-    sequence.sequence[sequence.items].output    = src_step->output;
+    sequence.sequence[sequence.items].countdown = srcstep->countdown;
+    sequence.sequence[sequence.items].value     = srcstep->value;
+    sequence.sequence[sequence.items].channel   = srcstep->channel;
 
     sequence.items++;
 
+    printSequence();
+
     return (int8_t)sequence.items;
+
+
 }
 
 // Pop first item from queue.
 // Returns number of items left in queue, or -1 if queue already was empty.
 // If argument is not NULL, first item is copied to pointer address before sequence shift.
 // Rest of sequence is shifted one step, empty steps are additionally cleared.
-int8_t popSequence(tSequenceStep* dst_step)
+int8_t popSequence(tSequenceStep* dststep)
 {
     int i = 0;
 
@@ -160,12 +301,11 @@ int8_t popSequence(tSequenceStep* dst_step)
         return -1;
     }
 
-    if(dst_step != NULL)
+    if(dststep != NULL)
     {
-        dst_step.countdown  = sequence.sequence[0].countdown;
-        dst_step.value      = sequence.sequence[0].value;
-        dst_step.channel    = sequence.sequence[0].channel;
-        dst_step.output     = sequence.sequence[0].output;
+        dststep->countdown  = sequence.sequence[0].countdown;
+        dststep->value      = sequence.sequence[0].value;
+        dststep->channel    = sequence.sequence[0].channel;
     }
 
     if(sequence.items == 1)
@@ -182,7 +322,6 @@ int8_t popSequence(tSequenceStep* dst_step)
         sequence.sequence[i].countdown  = sequence.sequence[i+1].countdown;
         sequence.sequence[i].value      = sequence.sequence[i+1].value;
         sequence.sequence[i].channel    = sequence.sequence[i+1].channel;
-        sequence.sequence[i].output     = sequence.sequence[i+1].output;
     }
 
     // Clear remaining positions:
@@ -191,8 +330,9 @@ int8_t popSequence(tSequenceStep* dst_step)
         sequence.sequence[i].countdown  = 0;
         sequence.sequence[i].value      = 0;
         sequence.sequence[i].channel    = 0;
-        sequence.sequence[i].output     = 0;
     }
+
+    printSequence();
 
     return (int8_t)sequence.items;
 
@@ -200,22 +340,35 @@ int8_t popSequence(tSequenceStep* dst_step)
 
 int8_t replaceSequence(tSequenceStep* new_step)
 {
+    if(sequence.items == 0)
+    {
+        return -1;
+    }
+
+    if(new_step == NULL)
+    {
+        return -1;
+    }
+
+    sequence.sequence[sequence.items].countdown = new_step->countdown;
+    sequence.sequence[sequence.items].value     = new_step->value;
+    sequence.sequence[sequence.items].channel   = new_step->channel;
+
     return 0;
 }
 
-int8_t peekStep(tSequenceStep* dst_step, uint8_t src_step)
+int8_t peekStep(tSequenceStep* dststep, uint8_t src_step)
 {
     if(src_step > sequence.items)
     {
         return -1;
     }
 
-    if(dst_step != NULL)
+    if(dststep != NULL)
     {
-        dst_step.countdown = sequence.sequence[src_step]->countdown;
-        dst_step.value     = sequence.sequence[src_step]->value;
-        dst_step.channel   = sequence.sequence[src_step]->channel;
-        dst_step.output    = sequence.sequence[src_step]->output;
+        dststep->countdown = sequence.sequence[src_step].countdown;
+        dststep->value     = sequence.sequence[src_step].value;
+        dststep->channel   = sequence.sequence[src_step].channel;
     }
 
     return (int8_t)src_step;
@@ -228,9 +381,33 @@ void sendMsg((char*)src, uint16_t len)
 }
 */
 
+int16_t stepDance(uint16_t milliseconds)
+{
+    if(sequence.items == 0)
+    {
+        // Non-fatal error
+        return -1;
+    }
+
+    if(sequence.sequence[0].countdown > milliseconds)
+    {
+        sequence.sequence[0].countdown -= milliseconds;
+        return sequence.sequence[0].countdown;
+    }
+
+    Serial.println("Executing step!");
+
+    setOutput(sequence.sequence[0].channel, sequence.sequence[0].value);
+
+    popSequence(NULL);
+}
+
+
 void setState(uint8_t newState)
 {
-    uint8_t set = STATE_IDLE;
+    tStates set = STATE_ERROR;
+    tSequenceStep step = {0};
+    int16_t curval = 0;
     
     if(newState <= STATE_MAX_STATE)
     {
@@ -239,13 +416,11 @@ void setState(uint8_t newState)
 
     Serial.print(millis());
     Serial.print(": S");
-    Serial.print(stateMachineState);
+    Serial.print(output[OUTPUT_VARIABLE_STATE].value);
     Serial.print(" -> S");
     Serial.println(set);
 
-    stateMachineState = set;
-    
-    switch(stateMachineState)
+    switch(set)
     {
         default:
         case STATE_IDLE:
@@ -254,6 +429,19 @@ void setState(uint8_t newState)
         }
         case STATE_STARTING:
         {
+            clearSequence();
+            step = {0, 0, OUTPUT_PWM_MOTOR_A};
+            pushSequence(&step);
+            step = {1000, 1, OUTPUT_RELAY_VOLTAGE};
+            pushSequence(&step);
+            step = {1000, 1, OUTPUT_RELAY_DRIVE};
+            pushSequence(&step);
+            step = {1000, 31, OUTPUT_PWM_MOTOR_A};
+            pushSequence(&step);
+            step = {1000, 127, OUTPUT_PWM_MOTOR_A};
+            pushSequence(&step);
+            step = {1000, 255, OUTPUT_PWM_MOTOR_A};
+            pushSequence(&step);
             break;
         }
         case STATE_TRAVERSING:
@@ -262,6 +450,18 @@ void setState(uint8_t newState)
         }
         case STATE_STOPPING:
         {
+            curval = output[OUTPUT_PWM_MOTOR_A].value;
+            clearSequence();
+            step = {0, curval/2, OUTPUT_PWM_MOTOR_A};
+            pushSequence(&step);
+            step = {1000, curval/4, OUTPUT_PWM_MOTOR_A};
+            pushSequence(&step);
+            step = {1000, 0, OUTPUT_PWM_MOTOR_A};
+            pushSequence(&step);
+            step = {1000, 0, OUTPUT_RELAY_DRIVE};
+            pushSequence(&step);
+            step = {1000, 0, OUTPUT_RELAY_VOLTAGE};
+            pushSequence(&step);
             break;
         }
         case STATE_CORRECTING:
@@ -270,9 +470,13 @@ void setState(uint8_t newState)
         }
         case STATE_ERROR:
         {
+            // Set STOP sequence
             break;
         }
     }
+
+    setOutput(OUTPUT_VARIABLE_STATE, set);
+
 }
 
 /** Check for bytes in UART receive buffer, and append them to our serial line
@@ -519,7 +723,7 @@ uint8_t parseCommand(void)
             {
                 // Report current state
                 Serial.print("S");
-                Serial.println(stateMachineState);
+                Serial.println(output[OUTPUT_VARIABLE_STATE].value);
                 break;
             }
 
@@ -623,32 +827,30 @@ void setup()
     Serial.print("\r");
     Serial.println("arduino-antrot 2020-04-06");
 
-    pinMode(MOTOR_OUT_A,        OUTPUT);
-    pinMode(MOTOR_OUT_B,        OUTPUT);
-    pinMode(RELAY_SPEED,        OUTPUT);
-    pinMode(RELAY_DIRECTION,    OUTPUT);
-    pinMode(RELAY_DRIVE,       OUTPUT);
+    Serial.println("Initializing outputs...");
+    
+    initializeOutputs();
+    
+    delay(100);
+
+    Serial.println("Initializing inputs...");
+
     pinMode(DIGITAL_INPUT_A,    INPUT_PULLUP);
     pinMode(DIGITAL_INPUT_B,    INPUT_PULLUP);
     pinMode(ANALOG_INPUT,       INPUT);
 
     attachInterrupt(digitalPinToInterrupt(DIGITAL_INPUT_A), directionChange, FALLING);
     attachInterrupt(digitalPinToInterrupt(DIGITAL_INPUT_B), toggleRun, FALLING);
-    
-    delay(100);
-
-    // Alright, nobody move!
-    digitalWrite(RELAY_SPEED, LOW);
-    digitalWrite(RELAY_DIRECTION, LOW);
-    digitalWrite(RELAY_DRIVE, LOW);
 
     delay(100);
+
+    Serial.println("Initializing Ethernet...");
 
     // Change 'SS' to your Slave Select pin, if you arn't using the default pin
-    if (!ether.begin(sizeof Ethernet::buffer, mymac, ETHER_CS))
+    if (!ether.begin(sizeof Ethernet::buffer, mymac, OUTPUT_PIN_ETHER_CS))
     {
         Serial.println( "Failed to access Ethernet controller!");
-        while(!ether.begin(sizeof Ethernet::buffer, mymac, ETHER_CS))
+        while(!ether.begin(sizeof Ethernet::buffer, mymac, OUTPUT_PIN_ETHER_CS))
         {
             delay(100);
         }
@@ -663,9 +865,9 @@ void setup()
     ether.printIp("GW:  ", ether.gwip);
     ether.printIp("DNS: ", ether.dnsip);
 
-    Serial.println("Starting listener...");
     ether.udpServerListenOnPort(&netRecv, srcPort);
 
+    Serial.println("Done.");
 }
 
 void directionChange()
@@ -709,30 +911,27 @@ void loop()
 {
     uint16_t input = analogRead(ANALOG_INPUT);
     uint16_t i = 0;
-    static int last = 0;
-    int now = millis();
+    static uint32_t last = 0;
+ 
+    uint32_t now = millis();
+    int diff = now - last;
+    
     ether.packetLoop(ether.packetReceive());
+    
     // State machine!
     
     doAlways();
+
+
 
     if(last == 0)
     {
         last = millis();
     }
     
-    if(false /* now-last > 5000 */)
+    if(diff >= 1)
     {
-        Serial.print("Command string: [");
-        Serial.flush();
-        for(i = 0; i < COMMAND_LINE_BUFFER_SIZE; i++)
-        {
-            Serial.print(cmdline[i] > 20 ? cmdline[i] : '.');
-            Serial.flush();
-        }
-        Serial.println("]");
-        Serial.flush();
-        
+        stepDance((uint16_t)diff);
         last = millis();
     }
 
