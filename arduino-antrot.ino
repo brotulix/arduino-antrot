@@ -1,11 +1,14 @@
 #include <stdint.h>
 #include <EtherCard.h> // for ENC28J60 module
 #include <IPAddress.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
 
 static byte mymac[] = { 0x00, 0x90, 0x62, 0xF1, 0xFA, 0xF0 };
 byte Ethernet::buffer[384];
-const uint16_t srcPort PROGMEM = 31550;
-const uint16_t dstPort PROGMEM = 31560;
+const uint16_t srcPort = 31550;
+const uint16_t dstPort = 31560;
 
 #define COMMAND_LINE_MAX_COMMAND_LENGTH         8 // Currently something like "#G,360;"
 #define COMMAND_LINE_MIN_COMMAND_LENGTH         3 // Currently something like "#P;"
@@ -14,7 +17,9 @@ const uint16_t dstPort PROGMEM = 31560;
 char cmdline[COMMAND_LINE_BUFFER_SIZE] = { 0 };
 uint8_t cmdlength = 0;
 
-#define MAX_SEQUENCE_LENGTH     10
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+
+#define MAX_SEQUENCE_LENGTH     20
 #define ANALOG_INPUT            A0
 #define DIGITAL_INPUT_A         2 // Interrupt pin
 #define DIGITAL_INPUT_B         3 // Interrupt pin
@@ -61,12 +66,14 @@ typedef enum OutputType
 
 typedef enum Outputs
 {
-    OUTPUT_RELAY_VOLTAGE,
-    OUTPUT_RELAY_DRIVE,
-    OUTPUT_RELAY_DIRECTION,
-    OUTPUT_PWM_MOTOR_A,
-    OUTPUT_VARIABLE_HEADING,
-    OUTPUT_VARIABLE_STATE,
+    OUTPUT_RELAY_VOLTAGE,       // For setting the voltage relay
+    OUTPUT_RELAY_DRIVE,         // For setting the drive relay
+    OUTPUT_RELAY_DIRECTION,     // For setting the direction relay
+    OUTPUT_PWM_MOTOR_A,         // For setting the PWM output
+    OUTPUT_VARIABLE_HEADING,    // For storing a target heading to reach
+    OUTPUT_VARIABLE_SPEED,      // For storing the target motor speed
+    OUTPUT_VARIABLE_STATE,      // For storing the state
+    OUTPUT_STATE,               // For triggering state change
     OUTPUT_NUM_VALUES
 } tOutputs;
 
@@ -90,7 +97,8 @@ typedef struct sequence_step
     tOutputs channel;
 } tSequenceStep;
 
-typedef struct sequence {
+typedef struct sequence
+{
     uint8_t items;
     tSequenceStep sequence[MAX_SEQUENCE_LENGTH];
 } tSequence;
@@ -103,11 +111,65 @@ typedef enum States
     STATE_IDLE          = 0,
     STATE_STARTING      = 1,
     STATE_TRAVERSING    = 2,
-    STATE_STOPPING      = 3,
-    STATE_CORRECTING    = 4,
-    STATE_ERROR         = 5,
+    STATE_REVERSING     = 3,
+    STATE_STOPPING      = 4,
+    STATE_CORRECTING    = 5,
+    STATE_ERROR         = 6,
     STATE_MAX_STATE     = STATE_ERROR
 } tStates;
+
+
+#define HEADING_AVERAGE_NUM_VALS    10
+typedef struct sHdgAvg {
+    uint16_t numvals;
+    uint16_t nextval;
+    float vals[HEADING_AVERAGE_NUM_VALS];
+} tHdgAvg;
+
+tHdgAvg hdgavg = { 0 };
+
+void hdgavgClear()
+{
+    uint8_t i = 0;
+    
+    hdgavg.nextval = 0;
+    hdgavg.numvals = 0;
+    
+    for(i = 0; i < HEADING_AVERAGE_NUM_VALS; i++)
+    {
+        hdgavg.vals[i] = 0.0;
+    }
+}
+
+float hdgavgGet()
+{
+    uint8_t i = 0;
+    float sum = 0.0;
+    for(i = 0; i < hdgavg.numvals; i++)
+    {
+        sum += hdgavg.vals[i];
+    }
+
+    return sum / hdgavg.numvals;
+}
+
+void hdgavgPut(float val)
+{
+    uint8_t i = 0;
+    
+    hdgavg.vals[hdgavg.nextval++] = val;
+    
+    if(hdgavg.nextval >= HEADING_AVERAGE_NUM_VALS)
+    {
+        hdgavg.nextval = 0;
+    }
+    
+    if(hdgavg.numvals < HEADING_AVERAGE_NUM_VALS)
+    {
+        hdgavg.numvals++;
+    }
+}
+
 
 
 
@@ -155,10 +217,26 @@ void initializeOutputs()
         0
     };
 
+    output[OUTPUT_VARIABLE_SPEED] = 
+    {
+        OUTPUT_VARIABLE_SPEED,
+        OUTPUT_TYPE_VARIABLE,
+        OUTPUT_PIN_UNUSED,
+        0
+    };
+
     output[OUTPUT_VARIABLE_STATE] =
     {
         OUTPUT_VARIABLE_STATE,
         OUTPUT_TYPE_VARIABLE,
+        OUTPUT_PIN_UNUSED,
+        0
+    };
+
+    output[OUTPUT_STATE] = 
+    {
+        OUTPUT_STATE,
+        OUTPUT_TYPE_STATE,
         OUTPUT_PIN_UNUSED,
         0
     };
@@ -191,7 +269,10 @@ void setOutput(tOutputs o, int16_t v)
                 output[o].value = v;
             }
 
-            digitalWrite(output[o].pin, output[o].value);
+            if(output[o].pin != OUTPUT_PIN_UNUSED)
+            {
+                digitalWrite(output[o].pin, output[o].value);
+            }
             
             break;
         }
@@ -215,7 +296,6 @@ void setOutput(tOutputs o, int16_t v)
         case OUTPUT_TYPE_VARIABLE:
         {
             output[o].value = v;
-            
             break;
         }
 
@@ -249,10 +329,11 @@ void clearSequence()
 void printSequence()
 {
     uint8_t i = 0;
-    Serial.print("Items in sequnce: ");
+    Serial.print("Items in sequence: ");
     Serial.println(sequence.items);
     
-    for(i = 0; i < MAX_SEQUENCE_LENGTH; i++)
+    //for(i = 0; i < MAX_SEQUENCE_LENGTH; i++)
+    for(i = 0; i < sequence.items; i++)
     {
         Serial.print("- Item ");
         Serial.print(i);
@@ -263,6 +344,11 @@ void printSequence()
         Serial.print(", ");
         Serial.println(sequence.sequence[i].channel);
     }
+}
+
+uint8_t getStepCount()
+{
+    return sequence.items;
 }
 
 int8_t pushSequence(tSequenceStep* srcstep)
@@ -279,7 +365,7 @@ int8_t pushSequence(tSequenceStep* srcstep)
 
     sequence.items++;
 
-    printSequence();
+    //printSequence();
 
     return (int8_t)sequence.items;
 
@@ -332,7 +418,7 @@ int8_t popSequence(tSequenceStep* dststep)
         sequence.sequence[i].channel    = 0;
     }
 
-    printSequence();
+    //printSequence();
 
     return (int8_t)sequence.items;
 
@@ -395,13 +481,59 @@ int16_t stepDance(uint16_t milliseconds)
         return sequence.sequence[0].countdown;
     }
 
-    Serial.println("Executing step!");
+    //Serial.println("Executing step!");
 
     setOutput(sequence.sequence[0].channel, sequence.sequence[0].value);
 
     popSequence(NULL);
 }
 
+void softStart()
+{
+    tSequenceStep step = {0};
+    uint16_t curval = output[OUTPUT_VARIABLE_SPEED].value;
+    //clearSequence();
+    step = {0, 0, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    //step = {1000, 0, OUTPUT_RELAY_VOLTAGE};
+    //pushSequence(&step);
+    step = {100, 1, OUTPUT_RELAY_DRIVE};
+    pushSequence(&step);
+    step = {100, curval/8, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    step = {100, curval/4, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    step = {100, curval/2, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    step = {100, curval, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+}
+
+void softStop()
+{
+    tSequenceStep step = {0};
+    int16_t curval = output[OUTPUT_VARIABLE_SPEED].value;
+    //clearSequence();
+    step = {0, curval/2, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    step = {100, curval/4, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    step = {100, curval/8, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    step = {100, 0, OUTPUT_PWM_MOTOR_A};
+    pushSequence(&step);
+    step = {100, 0, OUTPUT_RELAY_DRIVE};
+    pushSequence(&step);
+    //step = {1000, 0, OUTPUT_RELAY_VOLTAGE};
+    //pushSequence(&step);
+}
+
+void hardStop()
+{
+    setOutput(OUTPUT_PWM_MOTOR_A, 0);
+    setOutput(OUTPUT_RELAY_DRIVE, 0);
+    setOutput(OUTPUT_RELAY_VOLTAGE, 0);
+}
 
 void setState(uint8_t newState)
 {
@@ -430,17 +562,8 @@ void setState(uint8_t newState)
         case STATE_STARTING:
         {
             clearSequence();
-            step = {0, 0, OUTPUT_PWM_MOTOR_A};
-            pushSequence(&step);
-            step = {1000, 1, OUTPUT_RELAY_VOLTAGE};
-            pushSequence(&step);
-            step = {1000, 1, OUTPUT_RELAY_DRIVE};
-            pushSequence(&step);
-            step = {1000, 31, OUTPUT_PWM_MOTOR_A};
-            pushSequence(&step);
-            step = {1000, 127, OUTPUT_PWM_MOTOR_A};
-            pushSequence(&step);
-            step = {1000, 255, OUTPUT_PWM_MOTOR_A};
+            softStart();
+            step = {0, STATE_TRAVERSING, OUTPUT_STATE};
             pushSequence(&step);
             break;
         }
@@ -448,19 +571,22 @@ void setState(uint8_t newState)
         {
             break;
         }
+        case STATE_REVERSING:
+        {
+            clearSequence();
+            softStop();
+            step = {0, -1, OUTPUT_RELAY_DIRECTION};
+            pushSequence(&step);
+            softStart();
+            step = {0, STATE_TRAVERSING, OUTPUT_STATE};
+            pushSequence(&step);
+            break;
+        }
         case STATE_STOPPING:
         {
-            curval = output[OUTPUT_PWM_MOTOR_A].value;
             clearSequence();
-            step = {0, curval/2, OUTPUT_PWM_MOTOR_A};
-            pushSequence(&step);
-            step = {1000, curval/4, OUTPUT_PWM_MOTOR_A};
-            pushSequence(&step);
-            step = {1000, 0, OUTPUT_PWM_MOTOR_A};
-            pushSequence(&step);
-            step = {1000, 0, OUTPUT_RELAY_DRIVE};
-            pushSequence(&step);
-            step = {1000, 0, OUTPUT_RELAY_VOLTAGE};
+            softStop();
+            step = {0, STATE_IDLE, OUTPUT_STATE};
             pushSequence(&step);
             break;
         }
@@ -470,10 +596,17 @@ void setState(uint8_t newState)
         }
         case STATE_ERROR:
         {
+            clearSequence();
+            
             // Set STOP sequence
+            hardStop();
+
             break;
         }
     }
+
+    //step = {0, set, OUTPUT_VARIABLE_STATE};
+    //pushSequence(&step);
 
     setOutput(OUTPUT_VARIABLE_STATE, set);
 
@@ -496,15 +629,19 @@ void grabSerial()
         return;
     }
 
+    /*
     Serial.print("There's ");
     Serial.print(cmdlen);
     Serial.println(" bytes to be read.");
+    */
 
     avail = COMMAND_LINE_BUFFER_SIZE - cmdlength;
 
+    /*
     Serial.print("Can write ");
     Serial.print(avail);
     Serial.println(" bytes to buffer.");
+    */
 
     if(avail <= 0)
     {
@@ -516,9 +653,11 @@ void grabSerial()
         cmdlen = avail;
     }
 
+    /*
     Serial.print("Grabbing ");
     Serial.print(cmdlen);
     Serial.println(" bytes from serial port.");
+    */
 
 
     //cmdlength += Serial.readBytes((char*)(&cmdline[cmdlength]), avail);
@@ -611,6 +750,10 @@ uint8_t parseCommand(void)
 {
     uint8_t i = 0;
     uint8_t j = 0;
+    uint16_t p = 0;
+    int32_t v = 0;
+    int8_t k = 0;
+    uint8_t c = 0;
     uint8_t begin = cmdlength;
     uint8_t end = 0;
     uint8_t cmdlen = 0;
@@ -621,16 +764,6 @@ uint8_t parseCommand(void)
         return 0;
     }
     
-    Serial.print("Command string: [");
-    Serial.flush();
-    for(j = 0; j < COMMAND_LINE_BUFFER_SIZE; j++)
-    {
-        Serial.print(cmdline[j] > 20 ? cmdline[j] : '.');
-        Serial.flush();
-    }
-    Serial.println("]");
-    Serial.flush();
-
     // Locate a command
     for(i = 0; i < cmdlength; i++)
     {
@@ -658,16 +791,12 @@ uint8_t parseCommand(void)
         return cmdlength;
     }
 
-    //Serial.println("A");
-    
     if(begin > 0)
     {
         // Command start character is not the first in buffer; clean out crap
         stripCommand(begin);
         return begin;
     }
-
-    //Serial.println("B");
     
     if(begin > end)
     {
@@ -677,8 +806,6 @@ uint8_t parseCommand(void)
     }
 
     cmdlen = (end - begin) + 1;
-
-    //Serial.println("C");
     
     if((cmdlen > COMMAND_LINE_MAX_COMMAND_LENGTH) || (cmdlen < COMMAND_LINE_MIN_COMMAND_LENGTH))
     {
@@ -743,6 +870,224 @@ uint8_t parseCommand(void)
             {
                 setState(j);
             }
+            break;
+        }
+
+        case 'F': // Fast mode
+        {
+            if(cmdlen == COMMAND_LINE_MIN_COMMAND_LENGTH)
+            {
+                // Report current value
+                Serial.print("#F,");
+                Serial.print(output[OUTPUT_RELAY_VOLTAGE].value);
+                Serial.println(";");
+                break;
+            }
+
+            if(cmdlen > (COMMAND_LINE_MIN_COMMAND_LENGTH + 1))
+            {
+                Serial.println("#E;");
+                break;
+            }
+
+            if(output[OUTPUT_VARIABLE_STATE].value != STATE_IDLE)
+            {
+                Serial.println("#E,Illegal state for voltage change;");
+                break;
+            }
+
+            j = (uint8_t)cmdline[++j] - 0x30;
+            if(j > 1)
+            {
+                // Illegal value, just set it to the safe choice:
+                j = 0;
+            }
+            else
+            {
+                setOutput(OUTPUT_RELAY_VOLTAGE, j);
+            }
+            break;
+        }
+
+        case 'D':
+        {
+            if(cmdlen == COMMAND_LINE_MIN_COMMAND_LENGTH)
+            {
+                // Report current state
+                Serial.print("#D");
+                Serial.print(output[OUTPUT_RELAY_DIRECTION].value);
+                Serial.println(";");
+                break;
+            }
+
+            if(cmdlen > (COMMAND_LINE_MIN_COMMAND_LENGTH + 2))
+            {
+                Serial.println("#E;");
+                break;
+            }
+
+            if(cmdline[j+1] == '-')
+            {
+                j++;
+                k = -1;
+            }
+            else
+            {
+                k = 1;
+            }
+
+            j = (uint8_t)cmdline[++j] - 0x30;
+            if(j > 1)
+            {
+                // Illegal value, just set it to the safe choice:
+                j = 0;
+            }
+
+            if(output[OUTPUT_VARIABLE_STATE].value == STATE_IDLE)
+            {
+                setOutput(OUTPUT_RELAY_DIRECTION, k * j);
+                break;
+            }
+
+            if(output[OUTPUT_VARIABLE_STATE].value == STATE_TRAVERSING)
+            {
+                setState(STATE_REVERSING);
+                break;
+            }
+
+            Serial.println("#E;");
+            break;
+        }
+        
+        case 'A': // Analog output value; set PWM rate
+        {
+            if(cmdlen == COMMAND_LINE_MIN_COMMAND_LENGTH)
+            {
+                // Report current state
+                Serial.print("#A");
+                Serial.print(output[OUTPUT_VARIABLE_SPEED].value);
+                Serial.println(";");
+
+                break;
+            }
+
+            if(cmdlen > (COMMAND_LINE_MIN_COMMAND_LENGTH + 4))
+            {
+                Serial.println("#E;");
+                break;
+            }
+
+            v = 0;
+            p = 1;
+            for(j = 2; j < (cmdlen - i); j++)
+            {
+
+                k = (uint8_t)cmdline[cmdlen - j] - 0x30;
+                Serial.print("cmdline[");
+                Serial.print(cmdlen - j);
+                Serial.print("] is ");
+                Serial.println(k);
+                    
+                if(k <= 9) // it's cast to uint, so can't be less than 0
+                {
+                    v += p * k;
+                    Serial.print("New value: ");
+                    Serial.println(v);
+                    p = p * 10;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if(j == 0)
+            {
+                Serial.println("#E,Error parsing speed value;");
+                break;
+            }
+
+            setOutput(OUTPUT_VARIABLE_SPEED, v);
+
+            break;
+        }
+        
+        case 'H': // Set target heading
+        {
+            if(cmdlen == COMMAND_LINE_MIN_COMMAND_LENGTH)
+            {
+                // Report current state
+                Serial.print("#H,C,");
+                Serial.print(hdgavgGet());
+                Serial.print(",T,");
+                Serial.print(output[OUTPUT_VARIABLE_HEADING].value);
+                Serial.println(";");
+
+                break;
+            }
+
+            if(cmdlen > (COMMAND_LINE_MIN_COMMAND_LENGTH + 4))
+            {
+                Serial.println("#E;");
+                break;
+            }
+
+            if(cmdline[j+1] == '-')
+            {
+                k = -1;
+            }
+            else
+            {
+                k = 1;
+            }
+
+            v = 0;
+            p = 1;
+            for(j = 2; (k > 0 ? (j < (cmdlen - i)) : (j < (cmdlen - (i + 1)))); j++)
+            {
+                c = (uint8_t)cmdline[cmdlen - j] - 0x30;
+                
+                /*
+                Serial.print("cmdline[");
+                Serial.print(cmdlen - j);
+                Serial.print("] is ");
+                Serial.println(c);
+                */
+                    
+                if(c >= 0 && c <= 9)
+                {
+                    v += p * c;
+                    p = p * 10;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            v *= k;
+            /*
+            Serial.print("New value: ");
+            Serial.println(v);
+            */
+
+            if(k > 0 ? (j < (cmdlen - i)) : (j < (cmdlen - (i + 2))))
+            {
+                Serial.println("#E,Error parsing heading value;");
+                break;
+            }
+
+            if(v < -1 || v > 359)
+            {
+                Serial.println("#E,Heading outside bounds;");
+                break;
+            }
+
+            Serial.print("#H,T,");
+            Serial.print(v);
+            Serial.println(";");
+            
+            setOutput(OUTPUT_VARIABLE_HEADING, v);
             break;
         }
         
@@ -849,38 +1194,68 @@ void setup()
     // Change 'SS' to your Slave Select pin, if you arn't using the default pin
     if (!ether.begin(sizeof Ethernet::buffer, mymac, OUTPUT_PIN_ETHER_CS))
     {
-        Serial.println( "Failed to access Ethernet controller!");
+        //Serial.println( "Failed to access Ethernet controller!");
+        Serial.println("#E,Ethernet initialization failed;");
         while(!ether.begin(sizeof Ethernet::buffer, mymac, OUTPUT_PIN_ETHER_CS))
         {
-            delay(100);
+            delay(10);
         }
     }
 
     if (!ether.dhcpSetup())
     {
-        Serial.println("DHCP failed");
+        Serial.println("#E,DHCP failed;");
     }
 
-    ether.printIp("IP:  ", ether.myip);
-    ether.printIp("GW:  ", ether.gwip);
-    ether.printIp("DNS: ", ether.dnsip);
+    Serial.print("#I,");
+    ether.printIp(ether.myip);
+    Serial.print(",");
+    ether.printIp(ether.gwip);
+    Serial.print(",");
+    ether.printIp(ether.dnsip);
+    Serial.println(";");
 
     ether.udpServerListenOnPort(&netRecv, srcPort);
+
+    Serial.println("Initializing magnetometer...");
+    if(!mag.begin())
+    {
+        Serial.println("#E,Magnetometer error;");
+        while(1)
+        {
+            // Do naught
+            delay(10);
+        }
+    }
+
+    Serial.println("Initializing hdgavg...");
+    hdgavgClear();
 
     Serial.println("Done.");
 }
 
 void directionChange()
 {
+    static uint32_t last = millis();
     uint32_t thistime = millis();
-    if(thistime < lastinterrupt)
+    uint32_t diff = 0;
+    
+    if(last > thistime)
     {
         // handle rollover
+        diff--; // Roll over to max uint32_t
+        diff -= last; // Subtract last to get remainder until rollover
+        diff += thistime; // Add current time
+    }
+    else
+    {
+        diff = thistime - last;
     }
     
     // normal case
-    if(thistime - lastinterrupt > 50)
+    if(diff > 50)
     {
+        setOutput(OUTPUT_RELAY_DIRECTION, -1);
     }
 }
 
@@ -898,6 +1273,269 @@ void toggleRun()
     }
 }
 
+float getCompassHeading()
+{
+    sensors_event_t event; 
+    float heading = 0.0;
+    float temp = 0.0;
+    
+    // @TODO: Add configuration option for declination
+    const float declinationRadians = 0.064577; // Approx +3.7° for JO59 in 2020.
+    
+    mag.getEvent(&event);
+
+    /* Display the results (magnetic vector values are in micro-Tesla (uT)) */
+    /*
+    Serial.print("#M,");
+    Serial.print(event.magnetic.x);
+    Serial.print(",");
+    Serial.print(event.magnetic.y);
+    Serial.print(",");
+    Serial.print(event.magnetic.z);
+    Serial.println(",uT;");
+    */
+
+    // Hold the module so that Z is pointing 'up' and you can measure the heading with x&y
+    // Calculate heading when the magnetometer is level, then correct for signs of axis.
+    
+    // @TODO: Check installed orientation of sensor
+    heading = atan2(event.magnetic.y, event.magnetic.x);
+
+    // Once you have your heading, you must then add your 'Declination Angle', which is the 'Error' of the magnetic field in your location.
+    // Find yours here: http://www.magnetic-declination.com/
+    // Mine is: -13* 2' W, which is ~13 Degrees, or (which we need) 0.22 radians
+    // If you cannot find your Declination, comment out these two lines, your compass will be slightly off.
+    heading += declinationRadians;
+
+    // Correct for when signs are reversed.
+    if(heading < 0)
+    {
+        heading += 2 * M_PI;
+    }
+
+    // Check for wrap due to addition of declination.
+    if(heading > 2 * M_PI)
+    {
+        heading -= 2 * M_PI;
+    }
+
+    // Convert to degrees
+    temp = (heading * 0.5 * M_1_PI * 360.0) + 0.5;
+
+    /*
+    Serial.print("#H,");
+    Serial.print(millis());
+    Serial.print(",ms,");
+    Serial.print(heading);
+    Serial.print(",frad,");
+    Serial.print(temp);
+    Serial.println(",fdeg;");
+    */
+
+    return temp;
+}
+
+void stateMachine()
+{
+    static uint32_t lastreading = 0;
+    static uint32_t lastaverage = 0;
+    static float lasthdg = -1.0;
+
+    tSequenceStep step = {0};
+    uint32_t now = millis();
+    uint32_t readdiff = 0;
+    uint32_t avgdiff = 0;
+    float dps = 0.0; // degrees per iteration
+    float hdg = 0.0; // current heading
+    float dlh = 0.0; // delta last heading
+    float dth = 0.0; // delta target heading
+    uint32_t iacs = 0; // iterations at current speed
+
+    // First call regardless of state:
+    if(lasthdg < 0.0 && lastreading == 0)
+    {
+        Serial.println("Getting first reading...");
+        //Serial.print("Getting first reading @ ");
+        lastreading = now; //millis();
+        lastaverage = now; //millis();
+        hdg = getCompassHeading();
+        
+        lasthdg = hdg;
+        
+        hdgavgPut(hdg);
+
+        //Serial.print("lasthdg is now: ");
+        //Serial.println(lasthdg);
+    }
+    else
+    {
+        if(now > lastreading)
+        {
+            readdiff = now - lastreading;
+        }
+        else
+        {
+            readdiff = ((uint32_t)-1) - lastreading;
+            readdiff += now; // add wraparound positive value
+        }
+        
+        if(now > lastaverage)
+        {
+            avgdiff = now - lastaverage;
+        }
+        else
+        {
+            avgdiff = ((uint32_t)-1) - lastaverage;
+            avgdiff += now; // add wraparound positive value
+        }
+    }
+    
+    switch (output[OUTPUT_VARIABLE_STATE].value)
+    {
+        default:
+        case STATE_IDLE:
+        {
+            break;
+        }
+
+        case STATE_STARTING:
+        {
+            break;
+        }
+
+        case STATE_TRAVERSING:
+        {
+            
+            // If no step, add one in a bit:
+            if(!getStepCount())
+            {
+                //Serial.println("Sequence empty, adding refresh step...");
+                step = {
+                    100,                               // countdown
+                    output[OUTPUT_VARIABLE_SPEED].value,   // value
+                    OUTPUT_PWM_MOTOR_A                  // channel
+                };
+                pushSequence(&step);
+            }
+
+            if(lastreading != now && readdiff >= 10)
+            {
+                hdg = getCompassHeading();
+
+                hdgavgPut(hdg);
+                lastreading = now;
+            }
+
+            if(lastaverage != now && avgdiff >= 500)
+            {
+                hdg = hdgavgGet();
+
+                Serial.print("#H,C,");
+                Serial.print(hdg);
+                Serial.print(",T,");
+                Serial.print(output[OUTPUT_VARIABLE_HEADING].value);
+                Serial.println(";");
+
+                if(output[OUTPUT_VARIABLE_HEADING].value != -1)
+                {
+                    dlh = hdg - lasthdg;
+
+                    dth = hdg - output[OUTPUT_VARIABLE_HEADING].value;
+
+                    if(dth > 180.0)
+                    {
+                        Serial.println("-360");
+                        dth -= 360.0;
+                    }
+
+                    if(dth < -180.0)
+                    {
+                        Serial.println("+360");
+                        dth += 360.0;
+                    }
+
+                    dps = abs(1000.0 * dlh) / avgdiff;
+                    iacs = (abs(dth) / dps);
+
+                    /*
+                    Serial.print("\t\tDelta heading: ");
+                    Serial.print(dlh);
+                    Serial.print(" (=");
+                    Serial.print(dps);
+                    Serial.print(" dps) vs target hdg ");
+                    Serial.print(output[OUTPUT_VARIABLE_HEADING].value);
+                    Serial.print(" => ");
+                    Serial.print(iacs);
+                    Serial.print(" it ");
+                    if(dth >= 0.0)
+                    {
+                        Serial.println("clockwise");
+                    }
+                    else
+                    {
+                        Serial.println("counter-clockwise");
+                    }
+                    */
+
+                    if(abs(dth) < 2)
+                    {
+                        setOutput(OUTPUT_VARIABLE_HEADING, -1);
+                        //Serial.println("Sequence empty, adding refresh step...");
+                        step = {
+                            0,                  // countdown
+                            STATE_STOPPING,     // value
+                            OUTPUT_STATE        // channel
+                        };
+                        pushSequence(&step);
+                    }
+                    else
+                    {
+                        if(
+                            (dth >= 0.0 && output[OUTPUT_RELAY_DIRECTION].value != 0)
+                            ||
+                            (dth < 0.0 && output[OUTPUT_RELAY_DIRECTION].value != 1)
+                        )
+                        {
+                            step = {
+                                0,                  // countdown
+                                STATE_REVERSING,    // value
+                                OUTPUT_STATE        // channel
+                            };
+                            pushSequence(&step);
+                        }
+                    }
+                }
+
+                lasthdg = hdg;
+                lastaverage = now;
+            }
+
+            break;
+        }
+
+        case STATE_STOPPING:
+        {
+            break;
+        }
+
+        case STATE_CORRECTING:
+        {
+            break;
+        }
+
+        case STATE_REVERSING:
+        {
+            break;
+        }
+
+        case STATE_ERROR:
+        {
+            break;
+        }
+    
+    }
+}
+
 void doAlways()
 {
     // Always read serial port (for any new commands)
@@ -905,6 +1543,8 @@ void doAlways()
 
     // Always parse any arrived messages
     parseCommand();
+
+    stateMachine();
 }
 
 void loop()
@@ -921,8 +1561,6 @@ void loop()
     // State machine!
     
     doAlways();
-
-
 
     if(last == 0)
     {
